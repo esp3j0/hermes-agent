@@ -11,7 +11,8 @@
 #
 services:
   gateway:
-    image: nousresearch/hermes-agent:latest
+    # image: nousresearch/hermes-agent:latest
+    build: .
     container_name: hermes
     restart: unless-stopped
     volumes:
@@ -22,7 +23,8 @@ services:
     command: ["gateway", "run"]
 
   dashboard:
-    image: nousresearch/hermes-agent:latest
+    # image: nousresearch/hermes-agent:latest
+    build: .
     container_name: hermes-dashboard
     restart: unless-stopped
     depends_on:
@@ -30,6 +32,7 @@ services:
     volumes:
       - ${USERPROFILE}/.hermes:/opt/data
     environment:
+      - HERMES_DUMP_REQUESTS=1
       - HERMES_UID=10000
       - HERMES_GID=10000
       - HERMES_DASHBOARD_HOST=0.0.0.0
