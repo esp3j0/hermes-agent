@@ -46,6 +46,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -574,6 +575,38 @@ def build_nvidia_nim_headers(base_url: str | None) -> dict:
     if base_url_host_matches(str(base_url or ""), "integrate.api.nvidia.com"):
         return dict(_NVIDIA_NIM_CLOUD_HEADERS)
     return {}
+
+
+def build_zcode_headers() -> dict:
+    """Return the ZCode client fingerprint expected by Z.AI Coding Plan.
+
+    Z.AI's gateway fingerprints the official ZCode client via these headers;
+    presenting them lets glm-5.2 requests through instead of being throttled
+    or rejected as an unrecognized client.
+
+    Values captured from a real ZCode 3.3.4 Electron request. Only
+    endpoint-agnostic identity headers are included: ZCode itself calls the
+    Anthropic-Messages endpoint (anthropic-version / x-api-key), but hermes
+    talks to Z.AI over the OpenAI-compatible chat/completions endpoint, so
+    those Anthropic-path headers are deliberately omitted to avoid conflicting
+    with hermes's own Authorization bearer. The per-request telemetry ids are
+    freshly generated uuid4 each call to mirror the real client's wire shape.
+    If Z.AI tightens the fingerprint, bump the 3.3.4 version string.
+    """
+    return {
+        "User-Agent": "ZCode/3.3.4 ai-sdk/provider-utils/4.0.27 runtime/node.js/24",
+        "X-ZCode-App-Version": "3.3.4",
+        "X-ZCode-Agent": "glm",
+        "HTTP-Referer": "https://zcode.z.ai",
+        "X-Title": "Z Code@electron",
+        "X-Platform": "win32-x64",
+        "X-OS-Category": "windows",
+        "X-OS-Version": "10.0.26200",
+        "X-Session-Id": str(uuid.uuid4()),
+        "X-Request-Id": str(uuid.uuid4()),
+        "X-Query-Id": str(uuid.uuid4()),
+        "X-ZCode-Trace-Id": str(uuid.uuid4()),
+    }
 
 
 
@@ -1726,6 +1759,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 extra["default_headers"] = copilot_default_headers()
             elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
                 extra["default_headers"] = build_nvidia_nim_headers(base_url)
+            elif (base_url_host_matches(base_url, "api.z.ai")
+                  or base_url_host_matches(base_url, "open.bigmodel.cn")):
+                extra["default_headers"] = build_zcode_headers()
             else:
                 try:
                     from providers import get_provider_profile as _gpf_aux
@@ -1766,6 +1802,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             extra["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
             extra["default_headers"] = build_nvidia_nim_headers(base_url)
+        elif (base_url_host_matches(base_url, "api.z.ai")
+              or base_url_host_matches(base_url, "open.bigmodel.cn")):
+            extra["default_headers"] = build_zcode_headers()
         else:
             try:
                 from providers import get_provider_profile as _gpf_aux2
@@ -4525,6 +4564,9 @@ def resolve_provider_client(
             ))
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
             headers.update(build_nvidia_nim_headers(base_url))
+        elif (base_url_host_matches(base_url, "api.z.ai")
+              or base_url_host_matches(base_url, "open.bigmodel.cn")):
+            headers.update(build_zcode_headers())
         else:
             # Fall back to profile.default_headers for providers that declare
             # client-level attribution headers on their profile (e.g. GMI

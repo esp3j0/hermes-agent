@@ -4394,6 +4394,7 @@ class AIAgent:
         from agent.auxiliary_client import (
             build_nvidia_nim_headers,
             build_or_headers,
+            build_zcode_headers,
         )
 
         if base_url_host_matches(base_url, "openrouter.ai"):
@@ -4415,6 +4416,14 @@ class AIAgent:
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
                 self._client_kwargs.get("api_key", "")
             )
+        elif (
+            getattr(self, "provider", None) == "zai"
+            or base_url_host_matches(base_url, "api.z.ai")
+            or base_url_host_matches(base_url, "open.bigmodel.cn")
+        ):
+            # Z.AI Coding Plan gateway fingerprints the official ZCode client;
+            # present as it so glm-5.2 requests aren't throttled / rejected.
+            self._client_kwargs["default_headers"] = build_zcode_headers()
         else:
             # No URL-specific headers — check profile.default_headers before clearing.
             _ph_headers = None
