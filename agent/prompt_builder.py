@@ -1146,6 +1146,29 @@ def build_environment_hints() -> str:
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)
 
+    # Multi-backend (P0): when more than one named backend is available, tell
+    # the agent it can route commands per-call via terminal(backend=<name>).
+    # Single-backend (legacy default) stays silent to avoid prompt noise.
+    try:
+        from tools.terminal_tool import _load_backends_config, _filter_by_runtime
+        _mb_all, _mb_default = _load_backends_config()
+        _mb_filtered = _filter_by_runtime(_mb_all)
+        if len(_mb_filtered) > 1:
+            _mb_lines = []
+            for _name, _spec in _mb_filtered.items():
+                _raw_desc = str(_spec.get("description") or "").strip()
+                _desc = (_raw_desc.splitlines()[0] if _raw_desc else _spec.get("env", "?"))
+                _mb_lines.append(f"  - {_name} ({_spec.get('env', '?')}): {_desc}")
+            hints.append(
+                "Multiple terminal backends are available. Pass `backend=<name>` "
+                "to the `terminal` tool to choose where a command runs:\n"
+                + "\n".join(_mb_lines)
+                + f"\nOmit `backend` to use the default ({_mb_default}). "
+                  "Each backend keeps its own working directory."
+            )
+    except Exception:
+        pass
+
     # Embedder-supplied environment description. Lets a host that wraps Hermes
     # (e.g. a sandbox runner / managed platform) explain the environment the
     # agent is running in — proxy, credential handling, mount layout — without
