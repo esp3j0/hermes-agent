@@ -978,12 +978,34 @@ PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REP
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
 """
 
-# Global state for environment lifecycle management
-_active_environments: Dict[str, Any] = {}
-_last_activity: Dict[str, float] = {}
+# Global state for environment lifecycle management.
+# Keys are (collapsed_task_id, backend_name) tuples so a single task can hold
+# multiple backend instances (local + several SSH hosts) with independent
+# cwd/snapshot state. P0 hardcodes backend=_DEFAULT_BACKEND everywhere; Step 4
+# makes this the real per-call selected backend.
+_active_environments: Dict[tuple, Any] = {}
+_last_activity: Dict[tuple, float] = {}
 _env_lock = threading.Lock()
-_creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
+_creation_locks: Dict[tuple, threading.Lock] = {}  # Per-(task,backend) locks
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
+
+# P0 default backend name. Per-call backend selection (terminal(backend="gpu"))
+# arrives in Step 4; until then every key uses this sentinel.
+_DEFAULT_BACKEND = "default"
+
+
+def _env_key(task_id: str, backend: str = _DEFAULT_BACKEND) -> tuple:
+    """Compose the cache key for _active_environments / _last_activity / _creation_locks."""
+    return (task_id, backend)
+
+
+def _as_key(task_id) -> tuple:
+    """Normalize a str task_id (→ (task_id, default)) or pass through a tuple key.
+
+    Public cleanup/lookup entry points accept str task_id from callers that
+    predate multi-backend; internal iterators yield tuple keys directly.
+    """
+    return task_id if isinstance(task_id, tuple) else (task_id, _DEFAULT_BACKEND)
 _cleanup_thread = None
 _cleanup_running = False
 
@@ -1106,7 +1128,7 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # updates the originating session's env.
         container_id = _resolve_container_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(_env_key(task_id)) or _active_environments.get(_env_key(container_id))
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -1144,10 +1166,6 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     session to spin up its own container.  Only overrides containing
     backend-specific image keys or ``env_type`` trigger isolation.
     """
-    _ISOLATION_KEYS = frozenset({
-        "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "env_type",
-    })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
         if set(overrides.keys()) & _ISOLATION_KEYS:
@@ -1377,6 +1395,239 @@ def _get_env_config() -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Multi-backend configuration (P0)
+# ---------------------------------------------------------------------------
+# Named backends table loaded from yaml `terminal.backends`. Each entry is a
+# normalized dict with at least: env, cwd, timeout, risk_level, approval,
+# force_allowed, deny, allow_only — plus backend-type-specific fields
+# (host/user/port/key for ssh; image/cpu/memory/... for containers). Legacy
+# single-backend env vars collapse into one entry named _DEFAULT_BACKEND so
+# pre-multi-backend behavior is preserved when no `backends` table is present.
+
+_VALID_ENV_TYPES = frozenset({"local", "docker", "ssh", "singularity", "modal", "daytona"})
+
+# Override keys that signal "this task wants its own isolated backend" (RL /
+# benchmark sandboxes). Used by _resolve_container_task_id (task folding) and
+# resolve_env_key (L1 lock). "backend" lets an override pin a specific named
+# backend for a rollout.
+_ISOLATION_KEYS = frozenset({
+    "docker_image", "modal_image", "singularity_image",
+    "daytona_image", "env_type", "backend",
+})
+
+
+def _normalize_backends(raw: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Validate + normalize a yaml ``backends`` mapping.
+
+    Drops entries with an unsupported ``env`` (logging a warning) rather than
+    raising, so one bad entry doesn't disable the whole tool. Fills defaults
+    for ``risk_level`` / ``approval`` / ``force_allowed`` / ``deny`` / ``allow_only``.
+    """
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for name, spec in raw.items():
+        if not isinstance(name, str) or not name:
+            logger.warning("terminal.backends: skipping non-string name %r", name)
+            continue
+        if not isinstance(spec, dict):
+            logger.warning("terminal.backends.%s: skipping non-mapping spec", name)
+            continue
+        env = str(spec.get("env", "")).strip().lower()
+        if env not in _VALID_ENV_TYPES:
+            logger.warning("terminal.backends.%s: invalid env %r — dropping", name, env)
+            continue
+        b = dict(spec)
+        b["env"] = env
+        # Per-env default cwd mirrors _get_env_config: local → host cwd, ssh → ~,
+        # containers → /root. An explicit cwd in yaml wins.
+        if "cwd" not in b:
+            b["cwd"] = "" if env == "local" else ("~" if env == "ssh" else "/root")
+        b.setdefault("timeout", 180)
+        b.setdefault("risk_level", 1)
+        b.setdefault("approval", "high_risk")
+        b.setdefault("force_allowed", True)
+        b.setdefault("deny", [])
+        b.setdefault("allow_only", [])
+        # SSH key must be relative to HERMES_HOME (the credential_files sandbox
+        # enforces this at mount/use time via validate_within_dir). Warn on an
+        # obviously absolute path so misconfiguration surfaces early.
+        if env == "ssh":
+            key = str(b.get("key", "")).strip()
+            if not key:
+                logger.warning("terminal.backends.%s: ssh backend missing 'key'", name)
+            elif os.path.isabs(key):
+                logger.warning(
+                    "terminal.backends.%s: ssh key should be relative to HERMES_HOME, "
+                    "got absolute %r", name, key)
+            else:
+                # Resolve relative to HERMES_HOME so ssh -i receives an absolute
+                # path. A bare relative path would be interpreted against the
+                # container's cwd and silently fail to authenticate.
+                from hermes_constants import get_hermes_home
+                key = str(get_hermes_home() / key)
+            b["key"] = key
+        normalized[name] = b
+    return normalized
+
+
+def _legacy_env_as_backends(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Wrap a legacy single-backend ``_get_env_config()`` result as one default entry.
+
+    Preserves pre-multi-backend behavior when ``terminal.backends`` is absent.
+    """
+    env_type = cfg.get("env_type", "local") or "local"
+    b: Dict[str, Any] = {
+        "env": env_type,
+        "cwd": cfg.get("cwd", ""),
+        "timeout": cfg.get("timeout", 180),
+        "risk_level": 1,
+        "approval": "high_risk",
+        "force_allowed": True,
+        "deny": [],
+        "allow_only": [],
+    }
+    if env_type == "ssh":
+        b.update({
+            "host": cfg.get("ssh_host", ""),
+            "user": cfg.get("ssh_user", ""),
+            "port": cfg.get("ssh_port", 22),
+            "key": cfg.get("ssh_key", ""),
+            "persistent": cfg.get("ssh_persistent", True),
+        })
+    if env_type in _CONTAINER_BACKENDS:
+        image_key = {
+            "docker": "docker_image", "singularity": "singularity_image",
+            "modal": "modal_image", "daytona": "daytona_image",
+        }.get(env_type, "docker_image")
+        b.update({
+            "image": cfg.get(image_key, ""),
+            "container_cpu": cfg.get("container_cpu", 1),
+            "container_memory": cfg.get("container_memory", 5120),
+            "container_disk": cfg.get("container_disk", 51200),
+            "container_persistent": cfg.get("container_persistent", True),
+            "modal_mode": cfg.get("modal_mode", "auto"),
+            "docker_volumes": cfg.get("docker_volumes", []),
+            "docker_mount_cwd_to_workspace": cfg.get("docker_mount_cwd_to_workspace", False),
+            "docker_forward_env": cfg.get("docker_forward_env", []),
+            "docker_env": cfg.get("docker_env", {}),
+            "docker_run_as_host_user": cfg.get("docker_run_as_host_user", False),
+            "docker_extra_args": cfg.get("docker_extra_args", []),
+            "docker_persist_across_processes": cfg.get("docker_persist_across_processes", True),
+            "docker_orphan_reaper": cfg.get("docker_orphan_reaper", True),
+        })
+    if env_type == "local":
+        b["local_persistent"] = cfg.get("local_persistent", False)
+    return {_DEFAULT_BACKEND: b}
+
+
+def _load_backends_config() -> tuple:
+    """Load the named-backends table. Priority: yaml ``terminal.backends`` > legacy env.
+
+    Returns ``(backends_map, default_backend_name)``. Never raises — on any
+    read error it falls back to the legacy single-backend synthesis so the
+    terminal tool stays usable.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
+        backends_yaml = terminal_cfg.get("backends") if isinstance(terminal_cfg, dict) else None
+        if isinstance(backends_yaml, dict) and backends_yaml:
+            default_name = str(terminal_cfg.get("default_backend", _DEFAULT_BACKEND)) or _DEFAULT_BACKEND
+            normalized = _normalize_backends(backends_yaml)
+            if not normalized:
+                logger.warning("terminal.backends present but empty/invalid; using legacy env")
+                return _legacy_env_as_backends(_get_env_config()), _DEFAULT_BACKEND
+            if default_name not in normalized:
+                default_name = next(iter(normalized))
+            return normalized, default_name
+    except Exception as exc:  # never let config read failure kill terminal
+        logger.warning("terminal.backends load failed (%s); using legacy env", exc)
+    return _legacy_env_as_backends(_get_env_config()), _DEFAULT_BACKEND
+
+
+def _filter_by_runtime(backends: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Drop docker/singularity backends when hermes runs in a container.
+
+    Spawning a container backend from inside a container needs Docker-in-Docker
+    or a mounted docker.sock (equivalent to host root). Default-off; an explicit
+    ``dinD_acknowledged: true`` opts back in. Mirrors the container detection
+    already used in hermes_cli/config.py for the legacy single-backend path.
+    """
+    try:
+        from hermes_constants import is_inside_container
+        if not is_inside_container():
+            return backends
+    except Exception:
+        return backends
+    return {
+        name: b for name, b in backends.items()
+        if b.get("env") not in ("docker", "singularity") or b.get("dinD_acknowledged")
+    }
+
+
+class BackendRejected(Exception):
+    """Raised when a requested backend is not selectable (not in allowlist, or
+    not authorized by the parent delegate's allowed_backends). Caught in execute
+    and surfaced to the agent as a structured error — it never causes a connection.
+    """
+
+    def __init__(self, backend: str, allowed, reason: str = "not in allowlist"):
+        self.backend = backend
+        self.allowed = list(allowed) if isinstance(allowed, (list, tuple, set, dict)) else [str(allowed)]
+        self.reason = reason
+        super().__init__(f"backend {backend!r} {reason} (allowed: {self.allowed})")
+
+
+def _derive_backend_from_override(overrides: Dict[str, Any]) -> str:
+    """Derive the locked backend name from an isolation-keyed override.
+
+    P0: RL/benchmark overrides predate named backends, so an override without an
+    explicit 'backend' key maps onto _DEFAULT_BACKEND (which itself collapses to
+    the matching env via _legacy_env_as_backends). Explicit per-rollout backend
+    pinning arrives when the override carries a 'backend' key.
+    """
+    if "backend" in overrides:
+        return str(overrides["backend"])
+    return _DEFAULT_BACKEND
+
+
+def resolve_env_key(task_id, backend_arg, *, backends, default_backend,
+                    delegate_backends=None) -> tuple:
+    """Four-layer arbitration → ((collapsed_task_id, backend_name), backend_name).
+
+    L1  infra lock   : RL/benchmark override with an isolation key pins the
+                       backend; agent choice is ignored (with a warning).
+    L1.5 delegate    : subagents may only pick from the parent's delegate_backends.
+    L2  agent + allow: agent choice (or default), must be in the runtime-filtered
+                       backends map (the allowlist).
+    """
+    collapsed = _resolve_container_task_id(task_id)
+    overrides = resolve_task_overrides(task_id)
+
+    # L1: infrastructure lock (RL / benchmark).
+    if overrides and (set(overrides.keys()) & _ISOLATION_KEYS):
+        locked = _derive_backend_from_override(overrides)
+        if backend_arg and backend_arg != locked:
+            logger.warning(
+                "task %s locked to backend %r by override; ignoring agent choice %r",
+                task_id, locked, backend_arg)
+        return (collapsed, locked), locked
+
+    # L1.5: delegate authorization (subagent).
+    if delegate_backends is not None:
+        chosen = backend_arg or default_backend
+        if chosen not in delegate_backends:
+            raise BackendRejected(chosen, delegate_backends, "not authorized by parent delegate")
+        return (collapsed, chosen), chosen
+
+    # L2: agent choice + allowlist.
+    chosen = backend_arg or default_backend
+    if chosen not in backends:
+        raise BackendRejected(chosen, backends)
+    return (collapsed, chosen), chosen
+
+
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     """Resolve direct vs managed Modal backend selection."""
     return resolve_modal_backend_state(
@@ -1544,9 +1795,10 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # background processes (their _last_activity gets refreshed to keep them alive).
     try:
         from tools.process_registry import process_registry
-        for task_id in list(_last_activity.keys()):
-            if process_registry.has_active_processes(task_id):
-                _last_activity[task_id] = current_time  # Keep sandbox alive
+        for _key in list(_last_activity.keys()):
+            # _key is (task_id, backend); keep-alive is per task across its backends.
+            if process_registry.has_active_processes(_key[0]):
+                _last_activity[_key] = current_time  # Keep sandbox alive
     except ImportError:
         pass
 
@@ -1557,17 +1809,17 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     envs_to_stop = []  # list of (task_id, env) pairs
 
     with _env_lock:
-        for task_id, last_time in list(_last_activity.items()):
+        for key, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
-                env = _active_environments.pop(task_id, None)
-                _last_activity.pop(task_id, None)
+                env = _active_environments.pop(key, None)
+                _last_activity.pop(key, None)
                 if env is not None:
-                    envs_to_stop.append((task_id, env))
+                    envs_to_stop.append((key, env))
 
-        # Also purge per-task creation locks for cleaned-up tasks
+        # Also purge per-(task,backend) creation locks for cleaned-up envs
         with _creation_locks_lock:
-            for task_id, _ in envs_to_stop:
-                _creation_locks.pop(task_id, None)
+            for key, _ in envs_to_stop:
+                _creation_locks.pop(key, None)
 
     # Phase 2: stop the actual sandboxes OUTSIDE the lock so other tool calls
     # are not blocked while Modal/Docker sandboxes shut down.
@@ -1639,7 +1891,7 @@ def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        return _active_environments.get(_env_key(lookup)) or _active_environments.get(_env_key(task_id))
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -1663,15 +1915,15 @@ def is_persistent_env(task_id: str) -> bool:
 
 def cleanup_all_environments():
     """Clean up ALL active environments. Use with caution."""
-    task_ids = list(_active_environments.keys())
+    keys = list(_active_environments.keys())
     cleaned = 0
     
-    for task_id in task_ids:
+    for key in keys:
         try:
-            cleanup_vm(task_id)
+            cleanup_vm(key)
             cleaned += 1
         except Exception as e:
-            logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
+            logger.error("Error cleaning %s: %s", key, e, exc_info=True)
     
     # Also clean any orphaned directories
     scratch_dir = _get_scratch_dir()
@@ -1713,13 +1965,15 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
     env = None
+    key = _as_key(task_id)
+    task_id = key[0]  # normalize: callers may pass a tuple key (cleanup_all) or a str task_id
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        env = _active_environments.pop(key, None)
+        _last_activity.pop(key, None)
 
-    # Clean up per-task creation lock
+    # Clean up per-(task,backend) creation lock
     with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+        _creation_locks.pop(key, None)
 
     # Invalidate stale file_ops cache entry
     try:
@@ -2015,6 +2269,8 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    backend: Optional[str] = None,
+    delegate_backends: Optional[List[str]] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2060,15 +2316,37 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
-        # Get configuration
+        # Get configuration. P0 keeps the legacy global config (for cwd
+        # sanitization + host_cwd) alongside the named-backend table; the
+        # selected backend's env/image/ssh/container fields come from bcfg.
         config = _get_env_config()
-        env_type = config["env_type"]
+        _all_backends, _default_backend = _load_backends_config()
+        _backends = _filter_by_runtime(_all_backends)
+        try:
+            (cache_key, backend_name) = resolve_env_key(
+                task_id, backend,
+                backends=_backends, default_backend=_default_backend,
+                delegate_backends=delegate_backends,
+            )
+        except BackendRejected as _rej:
+            return json.dumps({
+                "output": "", "exit_code": -1,
+                "error": f"Backend not selectable: {_rej}",
+                "status": "error",
+            }, ensure_ascii=False)
+        bcfg = _backends[backend_name]
+        env_type = bcfg["env"]
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
+        effective_task_id = cache_key[0]  # collapsed task_id (str portion)
+        # Multi-backend cache key: (collapsed_task, backend_name). _raw_key is
+        # the un-collapsed fallback for per-session surfaces (ACP/gateway) whose
+        # env may be cached under the originating session id pre-collapse.
+        _eff_key = cache_key
+        _raw_key = (task_id, backend_name) if task_id else None
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -2078,19 +2356,20 @@ def terminal_tool(
         # isolation-keyed RL/benchmark overrides keep resolving as before.
         overrides = resolve_task_overrides(task_id)
         
-        # Select image based on env type, with per-task override support
+        # Select image: per-task override (RL/benchmark) wins, else the named
+        # backend's configured image. local/ssh backends have no image → "".
         if env_type == "docker":
-            image = overrides.get("docker_image") or config["docker_image"]
+            image = overrides.get("docker_image") or bcfg.get("image", "")
         elif env_type == "singularity":
-            image = overrides.get("singularity_image") or config["singularity_image"]
+            image = overrides.get("singularity_image") or bcfg.get("image", "")
         elif env_type == "modal":
-            image = overrides.get("modal_image") or config["modal_image"]
+            image = overrides.get("modal_image") or bcfg.get("image", "")
         elif env_type == "daytona":
-            image = overrides.get("daytona_image") or config["daytona_image"]
+            image = overrides.get("daytona_image") or bcfg.get("image", "")
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or config["cwd"]
+        cwd = overrides.get("cwd") or bcfg.get("cwd", "") or config["cwd"]
         # A per-task cwd override (registered by the gateway/TUI for workspace
         # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
         # config["cwd"] was already sanitized for container backends in
@@ -2150,8 +2429,8 @@ def terminal_tool(
             # sharing, yet an env may already be cached under the originating
             # task_id; honor it instead of spawning a duplicate.
             _existing_key = (
-                effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
+                _eff_key if _eff_key in _active_environments
+                else (_raw_key if _raw_key and _raw_key in _active_environments else None)
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
@@ -2163,16 +2442,16 @@ def terminal_tool(
         if needs_creation:
             # Per-task lock: only one thread creates the sandbox, others wait
             with _creation_locks_lock:
-                if effective_task_id not in _creation_locks:
-                    _creation_locks[effective_task_id] = threading.Lock()
-                task_lock = _creation_locks[effective_task_id]
+                if _eff_key not in _creation_locks:
+                    _creation_locks[_eff_key] = threading.Lock()
+                task_lock = _creation_locks[_eff_key]
 
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
                     _existing_key = (
-                        effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
+                        _eff_key if _eff_key in _active_environments
+                        else (_raw_key if _raw_key and _raw_key in _active_environments else None)
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
@@ -2187,35 +2466,35 @@ def terminal_tool(
                         ssh_config = None
                         if env_type == "ssh":
                             ssh_config = {
-                                "host": config.get("ssh_host", ""),
-                                "user": config.get("ssh_user", ""),
-                                "port": config.get("ssh_port", 22),
-                                "key": config.get("ssh_key", ""),
-                                "persistent": config.get("ssh_persistent", False),
+                                "host": bcfg.get("host", ""),
+                                "user": bcfg.get("user", ""),
+                                "port": bcfg.get("port", 22),
+                                "key": bcfg.get("key", ""),
+                                "persistent": bcfg.get("persistent", False),
                             }
 
                         container_config = None
                         if env_type in {"docker", "singularity", "modal", "daytona"}:
                             container_config = {
-                                "container_cpu": config.get("container_cpu", 1),
-                                "container_memory": config.get("container_memory", 5120),
-                                "container_disk": config.get("container_disk", 51200),
-                                "container_persistent": config.get("container_persistent", True),
-                                "modal_mode": config.get("modal_mode", "auto"),
-                                "docker_volumes": config.get("docker_volumes", []),
-                                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                                "docker_forward_env": config.get("docker_forward_env", []),
-                                "docker_env": config.get("docker_env", {}),
-                                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                                "docker_extra_args": config.get("docker_extra_args", []),
-                                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "container_cpu": bcfg.get("container_cpu", 1),
+                                "container_memory": bcfg.get("container_memory", 5120),
+                                "container_disk": bcfg.get("container_disk", 51200),
+                                "container_persistent": bcfg.get("container_persistent", True),
+                                "modal_mode": bcfg.get("modal_mode", "auto"),
+                                "docker_volumes": bcfg.get("docker_volumes", []),
+                                "docker_mount_cwd_to_workspace": bcfg.get("docker_mount_cwd_to_workspace", False),
+                                "docker_forward_env": bcfg.get("docker_forward_env", []),
+                                "docker_env": bcfg.get("docker_env", {}),
+                                "docker_run_as_host_user": bcfg.get("docker_run_as_host_user", False),
+                                "docker_extra_args": bcfg.get("docker_extra_args", []),
+                                "docker_persist_across_processes": bcfg.get("docker_persist_across_processes", True),
+                                "docker_orphan_reaper": bcfg.get("docker_orphan_reaper", True),
                             }
 
                         local_config = None
                         if env_type == "local":
                             local_config = {
-                                "persistent": config.get("local_persistent", False),
+                                "persistent": bcfg.get("local_persistent", False),
                             }
 
                         new_env = _create_environment(
@@ -2238,8 +2517,8 @@ def terminal_tool(
                         }, ensure_ascii=False)
 
                     with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
+                        _active_environments[_eff_key] = new_env
+                        _last_activity[_eff_key] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
@@ -2367,6 +2646,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        backend=backend_name,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2375,6 +2655,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        backend=backend_name,
                     )
 
                 result_data = {
@@ -2924,6 +3205,20 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 from tools.registry import registry
 
+def _backend_names_for_schema() -> list:
+    """Static enum for the ``backend`` param (P0). Names are read once at module
+    import from the runtime-filtered backends table. The allowlist re-check
+    inside resolve_env_key is the authoritative gate at call time; hot-refresh
+    of backends added mid-session arrives in P2.
+    """
+    try:
+        _all, _ = _load_backends_config()
+        names = list(_filter_by_runtime(_all).keys())
+        return names or [_DEFAULT_BACKEND]
+    except Exception:
+        return [_DEFAULT_BACKEND]
+
+
 TERMINAL_SCHEMA = {
     "name": "terminal",
     "description": TERMINAL_TOOL_DESCRIPTION,
@@ -2962,6 +3257,11 @@ TERMINAL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
+            },
+            "backend": {
+                "type": "string",
+                "enum": _backend_names_for_schema(),
+                "description": "Named execution backend to run the command on (e.g. 'this' for the local host, 'gpu' for an SSH host). Omit to use the default backend. Available names come from terminal.backends; the runtime allowlist in resolve_env_key is authoritative."
             }
         },
         "required": ["command"]
@@ -2980,6 +3280,8 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        backend=args.get("backend"),
+        delegate_backends=kw.get("delegate_backends"),
     )
 
 

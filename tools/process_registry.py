@@ -93,6 +93,7 @@ class ProcessSession:
     id: str                                     # Unique session ID ("proc_xxxxxxxxxxxx")
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
+    backend: str = "default"                    # Named terminal backend (P0 multi-backend)
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
@@ -687,6 +688,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        backend: str = "default",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -703,6 +705,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            backend=backend,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -826,6 +829,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        backend: str = "default",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -843,6 +847,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            backend=backend,
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,

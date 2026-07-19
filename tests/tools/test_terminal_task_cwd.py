@@ -27,7 +27,7 @@ def test_foreground_command_uses_registered_task_cwd_for_existing_environment(mo
             return {"output": "ok", "returncode": 0}
 
     task_id = "acp-session-1"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key(task_id): FakeEnv()})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/acp"}})
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
@@ -54,7 +54,7 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
             return {"output": "ok", "returncode": 0}
 
     task_id = "acp-session-1"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key(task_id): FakeEnv()})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/acp"}})
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
@@ -89,7 +89,7 @@ def test_foreground_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch)
             return {"output": "ok", "returncode": 0}
 
     task_id = "session-live-cwd"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key(task_id): FakeEnv()})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
@@ -127,7 +127,7 @@ def test_background_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch)
 
     registry = FakeRegistry()
     task_id = "session-live-cwd-bg"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key(task_id): FakeEnv()})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
@@ -159,6 +159,7 @@ def test_background_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch)
         "session_key": task_id,
         "env_vars": {},
         "use_pty": False,
+        "backend": "default",
     }]
 
 
@@ -179,7 +180,7 @@ def test_registering_cwd_override_updates_live_env_cwd(monkeypatch):
 
     task_id = "acp-session-update"
     fake_env = FakeEnv()
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: fake_env})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key(task_id): fake_env})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
 
     terminal_tool.register_task_env_overrides(task_id, {"cwd": "/workspace/new"})
@@ -215,7 +216,7 @@ def test_registering_non_cwd_override_leaves_live_env_cwd_untouched(monkeypatch)
 
     task_id = "rl-rollout-1"
     fake_env = FakeEnv()
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: fake_env})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key(task_id): fake_env})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
 
     terminal_tool.register_task_env_overrides(task_id, {"modal_image": "custom:latest"})

@@ -48,8 +48,9 @@ def _run_terminal(
         "_check_all_guards",
         lambda *_args, **_kwargs: approval or {"approved": True},
     )
-    monkeypatch.setitem(terminal_tool_module._active_environments, "default", mock_env)
-    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    _cache_key = terminal_tool_module._env_key("default")
+    monkeypatch.setitem(terminal_tool_module._active_environments, _cache_key, mock_env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, _cache_key, 0.0)
 
     if invoke_hook is not _UNSET:
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
