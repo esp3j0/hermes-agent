@@ -49,6 +49,14 @@ class SSHEnvironment(BaseEnvironment):
         self.user = user
         self.port = port
         self.key_path = key_path
+        # Windows bind mounts expose the key as 0777 inside the container,
+        # which ssh refuses ("UNPROTECTED PRIVATE KEY FILE"). Tighten to 0600
+        # at construction; no-op on POSIX where the file is already 0600.
+        if key_path:
+            try:
+                os.chmod(key_path, 0o600)
+            except OSError:
+                pass
 
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
