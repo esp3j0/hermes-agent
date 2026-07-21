@@ -1164,7 +1164,12 @@ def build_environment_hints() -> str:
                 "to the `terminal` tool to choose where a command runs:\n"
                 + "\n".join(_mb_lines)
                 + f"\nOmit `backend` to use the default ({_mb_default}). "
-                  "Each backend keeps its own working directory."
+                  "Each backend keeps its own working directory. "
+                  "Prefer `terminal(backend=<name>)` over shelling out to "
+                  "`ssh <host>` when the target host has a configured backend. "
+                  "The backend preserves its session (cwd, env vars) and "
+                  "applies the usual command guards; a manual `ssh` is a "
+                  "stateless one-off."
             )
     except Exception:
         pass
