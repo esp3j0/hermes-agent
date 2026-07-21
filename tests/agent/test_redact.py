@@ -185,6 +185,34 @@ class TestEnvLookupPreserved:
         result = redact_sensitive_text(text, force=True)
         assert "os.getenv('HOMEASSISTANT_TOKEN')" in result
 
+    def test_json_field_os_getenv_preserved(self):
+        # _redact_env has the env-lookup exception; _redact_json (a separate
+        # closure, JSON key: "value" syntax) did not, and mangled this into
+        # '"apiKey": "os.get...EY')"'.
+        text = '{"apiKey": "os.getenv(\'OPENAI_API_KEY\')"}'
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_json_field_os_environ_get_preserved(self):
+        text = '{"token": "os.environ.get(\'MY_TOKEN\')"}'
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_json_field_real_value_still_redacted(self):
+        text = '{"apiKey": "sk-realSecretValue1234567890"}'
+        result = redact_sensitive_text(text, force=True)
+        assert "sk-realSecretValue1234567890" not in result
+
+    def test_yaml_field_os_getenv_preserved(self):
+        # Same exception missing from _redact_yaml (unquoted key: value
+        # syntax) — mangled 'api_key: os.getenv("OPENAI_API_KEY")' into
+        # 'api_key: os.get...EY")'.
+        text = 'api_key: os.getenv("OPENAI_API_KEY")'
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_yaml_field_real_value_still_redacted(self):
+        text = "api_key: sk-realSecretValue1234567890"
+        result = redact_sensitive_text(text, force=True)
+        assert "sk-realSecretValue1234567890" not in result
+
 
 class TestJsonFields:
     def test_json_api_key(self):
@@ -558,6 +586,57 @@ class TestWebUrlsNotRedacted:
         text = "postgres://admin:dbpass@db.internal:5432/app"
         result = redact_sensitive_text(text)
         assert "dbpass" not in result
+
+
+class TestStrictUrlCredentialRedaction:
+    @pytest.mark.parametrize(
+        ("text", "secret", "expected"),
+        [
+            (
+                "https://x.test/#access_token=FRAG_SECRET&view=public",
+                "FRAG_SECRET",
+                "https://x.test/#access_token=***&view=public",
+            ),
+            (
+                "/resume?token=REL_SECRET&view=public",
+                "REL_SECRET",
+                "/resume?token=***&view=public",
+            ),
+            (
+                "https://x.test/cb?client%5Fsecret=ENC_SECRET&view=public",
+                "ENC_SECRET",
+                "https://x.test/cb?client%5Fsecret=***&view=public",
+            ),
+            (
+                "https://x.test/cb?client%255Fsecret=DOUBLE_SECRET&view=public",
+                "DOUBLE_SECRET",
+                "https://x.test/cb?client%255Fsecret=***&view=public",
+            ),
+            (
+                "/resume?token=SEMICOLON_SECRET;view=public",
+                "SEMICOLON_SECRET",
+                "/resume?token=***;view=public",
+            ),
+            (
+                "//user:NET_SECRET@x.test/path",
+                "NET_SECRET",
+                "//user:***@x.test/path",
+            ),
+        ],
+    )
+    def test_masks_all_url_reference_forms_only_when_opted_in(
+        self, text, secret, expected
+    ):
+        assert redact_sensitive_text(text) == text
+
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+
+        assert secret not in result
+        assert result == expected
+
+    def test_similarly_named_public_params_remain_unchanged(self):
+        text = "/metrics?token_count=17&session_id=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == text
 
 
 class TestBareTokenUserinfoRedaction:
