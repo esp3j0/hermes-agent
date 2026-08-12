@@ -3625,13 +3625,11 @@ def intent_ack_continuation_enabled(agent) -> bool:
 
 
 def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:
-    """Copy provider-facing reasoning fields onto an API replay message.
+    """Copy provider-facing reasoning fields onto an API replay message."""
+    if source_msg.get("role") != "assistant":
+        return
 
-    Forwarder — the strip-vs-repad POLICY is owned by
-    ``agent.message_sanitization.apply_reasoning_content_policy`` (audit F4);
-    this only supplies the agent's cached provider-direction flag.
-    """
-    from agent.message_sanitization import apply_reasoning_content_policy
+    needs_thinking_pad = agent._needs_thinking_reasoning_pad()
 
     # 1. Explicit reasoning_content already set.
     #
