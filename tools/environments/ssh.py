@@ -9,7 +9,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from tools.environments.base import BaseEnvironment, _popen_bash
+from tools.environments.base import (
+    BaseEnvironment,
+    EnvironmentConnectionError,
+    _popen_bash,
+)
 from tools.environments.file_sync import (
     FileSyncManager,
     iter_sync_files,
@@ -112,15 +116,28 @@ class SSHEnvironment(BaseEnvironment):
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=15,
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
                 error_msg = result.stderr.strip() or result.stdout.strip()
-                raise RuntimeError(f"SSH connection failed: {error_msg}")
+                raise EnvironmentConnectionError(
+                    f"SSH connection failed: {error_msg}",
+                    retry_hint=(
+                        f"Verify {self.user}@{self.host}:{self.port} is reachable "
+                        "(host up, sshd running, key/agent auth working), then "
+                        "retry — the connection is re-established automatically."
+                    ),
+                )
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"SSH connection to {self.user}@{self.host} timed out")
+            raise EnvironmentConnectionError(
+                f"SSH connection to {self.user}@{self.host} timed out",
+                retry_hint=(
+                    f"Check network connectivity to {self.host}:{self.port} "
+                    "and that sshd is accepting connections, then retry."
+                ),
+            )
 
     def _detect_remote_home(self) -> str:
         """Detect the remote user's home directory."""
@@ -130,7 +147,7 @@ class SSHEnvironment(BaseEnvironment):
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=10,
                 stdin=subprocess.DEVNULL,
             )
@@ -157,7 +174,7 @@ class SSHEnvironment(BaseEnvironment):
         subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
@@ -172,7 +189,7 @@ class SSHEnvironment(BaseEnvironment):
         subprocess.run(
             mkdir_cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
@@ -186,12 +203,18 @@ class SSHEnvironment(BaseEnvironment):
         result = subprocess.run(
             scp_cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"scp failed: {result.stderr.strip()}")
+            raise EnvironmentConnectionError(
+                f"scp failed: {result.stderr.strip()}",
+                retry_hint=(
+                    f"File sync to {self.user}@{self.host} failed — verify the "
+                    "SSH connection is healthy, then retry."
+                ),
+            )
 
     def _ssh_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Upload many files in a single tar-over-SSH stream.
@@ -215,12 +238,18 @@ class SSHEnvironment(BaseEnvironment):
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=30,
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"remote mkdir failed: {result.stderr.strip()}")
+                raise EnvironmentConnectionError(
+                    f"remote mkdir failed: {result.stderr.strip()}",
+                    retry_hint=(
+                        f"Remote directory setup on {self.host} failed — verify "
+                        "the SSH connection is healthy, then retry."
+                    ),
+                )
 
         # Symlink staging avoids fragile GNU tar --transform rules.
         # On Windows without Developer Mode, symlink creation raises
@@ -293,7 +322,13 @@ class SSHEnvironment(BaseEnvironment):
                 ssh_proc.kill()
                 tar_proc.wait()
                 ssh_proc.wait()
-                raise RuntimeError("SSH bulk upload timed out")
+                raise EnvironmentConnectionError(
+                    "SSH bulk upload timed out",
+                    retry_hint=(
+                        f"Bulk file sync to {self.host} timed out — check the "
+                        "connection and retry."
+                    ),
+                )
 
             if tar_proc.returncode != 0:
                 raise RuntimeError(
@@ -301,9 +336,13 @@ class SSHEnvironment(BaseEnvironment):
                     f"{tar_stderr_raw.decode(errors='replace').strip()}"
                 )
             if ssh_proc.returncode != 0:
-                raise RuntimeError(
+                raise EnvironmentConnectionError(
                     f"tar extract over SSH failed (rc={ssh_proc.returncode}): "
-                    f"{ssh_stderr.decode(errors='replace').strip()}"
+                    f"{ssh_stderr.decode(errors='replace').strip()}",
+                    retry_hint=(
+                        f"File sync over SSH to {self.host} failed — verify the "
+                        "connection is healthy, then retry."
+                    ),
                 )
 
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
@@ -324,7 +363,13 @@ class SSHEnvironment(BaseEnvironment):
                 timeout=120,
             )
         if result.returncode != 0:
-            raise RuntimeError(f"SSH bulk download failed: {result.stderr.decode(errors='replace').strip()}")
+            raise EnvironmentConnectionError(
+                f"SSH bulk download failed: {result.stderr.decode(errors='replace').strip()}",
+                retry_hint=(
+                    f"File sync from {self.host} failed — verify the SSH "
+                    "connection is healthy, then retry."
+                ),
+            )
 
     def _ssh_delete(self, remote_paths: list[str]) -> None:
         """Batch-delete remote files in one SSH call."""
@@ -333,12 +378,18 @@ class SSHEnvironment(BaseEnvironment):
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"remote rm failed: {result.stderr.strip()}")
+            raise EnvironmentConnectionError(
+                f"remote rm failed: {result.stderr.strip()}",
+                retry_hint=(
+                    f"Remote file cleanup on {self.host} failed — verify the "
+                    "SSH connection is healthy, then retry."
+                ),
+            )
 
     def _before_execute(self) -> None:
         """Sync files to remote via FileSyncManager (rate-limited internally)."""

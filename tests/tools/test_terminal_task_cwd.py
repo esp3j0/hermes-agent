@@ -76,38 +76,44 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
     assert calls == [{"timeout": 60, "cwd": "/explicit/workdir", "bounded_capture": True}]
 
 
-def test_foreground_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
-    """A prior `cd` records the session cwd; terminal_tool must honor it."""
-    calls = []
+def test_explicit_workdir_does_not_persist_into_session_cwd(monkeypatch):
+    """A per-command ``workdir`` must not hijack the durable session cwd.
+
+    Regression: the post-command dual-write recorded ``env.cwd`` (stamped to
+    the transient ``workdir``) into the session-cwd store, so every later
+    command that omitted ``workdir`` inherited the one-off directory.
+    """
+    recorded = []
 
     class FakeEnv:
         env = {}
-        cwd = "/workspace/live"
+        cwd = "/workspace/acp"
 
         def execute(self, command, **kwargs):
-            calls.append((command, kwargs))
+            # Marker parse stamps env.cwd to where the command ran.
+            self.cwd = kwargs.get("cwd", self.cwd)
             return {"output": "ok", "returncode": 0}
 
     task_id = "session-live-cwd"
     monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key(task_id): FakeEnv()})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
-    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/acp"}})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
         lambda command, env_type, **kwargs: {"approved": True},
     )
-    # The prior command's completed `cd` recorded the session cwd.
-    terminal_tool.record_session_cwd(task_id, "/workspace/live")
+    monkeypatch.setattr(
+        terminal_tool,
+        "record_session_cwd",
+        lambda session_key, cwd: recorded.append((session_key, cwd)),
+    )
 
-    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+    terminal_tool.terminal_tool(command="pwd", task_id=task_id, workdir="/one/off/dir")
 
-    assert result["exit_code"] == 0
-    assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/live", "bounded_capture": True})]
+    # The transient workdir must NOT have been recorded as the session cwd.
+    assert all(cwd != "/one/off/dir" for _, cwd in recorded), recorded
 
 
 def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
