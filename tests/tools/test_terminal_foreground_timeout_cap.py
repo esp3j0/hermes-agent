@@ -6,6 +6,8 @@ are rejected with an error suggesting background=true.
 import json
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Shared test config dict — mirrors _get_env_config() return shape.
@@ -25,6 +27,17 @@ def _make_env_config(**overrides):
     }
     config.update(overrides)
     return config
+
+
+@pytest.fixture(autouse=True)
+def _pin_default_backend(monkeypatch):
+    """Pin a single 'default' local backend so multi-backend cache keys are
+    ('default','default'). These tests patch _active_environments with the
+    ('default','default') key; without this the real config's default_backend
+    (e.g. 'this') makes the key ('default','this') and the mock misses."""
+    from tools.terminal_tool import _normalize_backends
+    backends = _normalize_backends({"default": {"env": "local", "description": "test"}})
+    monkeypatch.setattr("tools.terminal_tool._load_backends_config", lambda: (backends, "default"))
 
 
 class TestForegroundTimeoutCap:

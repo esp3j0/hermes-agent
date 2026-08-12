@@ -3,6 +3,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -13,6 +15,18 @@ def _minimal_terminal_config(cwd="/default"):
         "timeout": 60,
         "lifetime_seconds": 3600,
     }
+
+
+@pytest.fixture(autouse=True)
+def _pin_default_backend(monkeypatch):
+    """Pin a single 'default' local backend so multi-backend cache keys are
+    ('default','default'). These tests predate multi-backend and patch
+    _active_environments assuming backend='default'; without this the real
+    config's default_backend (e.g. 'this') makes the key ('default','this')
+    and the patched mock misses."""
+    from tools.terminal_tool import _normalize_backends
+    backends = _normalize_backends({"default": {"env": "local", "description": "test"}})
+    monkeypatch.setattr("tools.terminal_tool._load_backends_config", lambda: (backends, "default"))
 
 
 def test_foreground_command_uses_registered_task_cwd_for_existing_environment(monkeypatch):
@@ -257,7 +271,7 @@ def test_stale_env_cwd_from_different_session_is_ignored(monkeypatch):
             return {"output": "ok", "returncode": 0}
 
     task_id = "session-B"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key("default"): FakeEnv()})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/home/user/src/hermes-agent"))
@@ -292,7 +306,7 @@ def test_same_session_recorded_cwd_survives_across_commands(monkeypatch):
 
     env = FakeEnv()
     task_id = "session-X"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {terminal_tool._env_key("default"): env})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
