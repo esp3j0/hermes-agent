@@ -17,7 +17,24 @@ Both paths now share ``_is_unusable_container_cwd()``; these tests pin its
 behaviour so neither path can regress.
 """
 
+import pytest
+
 import tools.terminal_tool as tt
+
+
+@pytest.fixture(autouse=True)
+def _legacy_backends(monkeypatch):
+    """These tests drive a patched ``_get_env_config`` (docker backend); pin
+    the backends loader to the legacy synthesis so a real HERMES_HOME's yaml
+    backends table (e.g. 'this' local) can't override the patched backend.
+    The ``tt._get_env_config`` lookup is deferred to call time so each test's
+    monkeypatch of it is honored."""
+    from tools.terminal_tool import _legacy_env_as_backends
+
+    monkeypatch.setattr(
+        "tools.terminal_tool._load_backends_config",
+        lambda: (_legacy_env_as_backends(tt._get_env_config()), "default"),
+    )
 
 
 class TestIsUnusableContainerCwd:

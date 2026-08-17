@@ -2324,10 +2324,28 @@ def _stop_cleanup_thread():
 
 
 def get_active_env(task_id: str):
-    """Return the active BaseEnvironment for *task_id*, or None."""
+    """Return the active BaseEnvironment for *task_id*, or None.
+
+    Multi-backend: envs are cached under ``(task, backend)``; the default
+    backend's env is what callers without a backend context (vision/image
+    tools) want. Raw string keys remain a fallback for legacy callers and
+    tests that patch ``_active_environments`` directly.
+    """
     lookup = _resolve_container_task_id(task_id)
+    _, default_backend = _load_backends_config()
     with _env_lock:
-        return _active_environments.get(_env_key(lookup)) or _active_environments.get(_env_key(task_id))
+        for key in (
+            _env_key(lookup, default_backend),
+            _env_key(task_id, default_backend),
+            _env_key(lookup),
+            _env_key(task_id),
+            lookup,
+            task_id,
+        ):
+            env = _active_environments.get(key)
+            if env is not None:
+                return env
+    return None
 
 
 def ensure_task_env(task_id: Optional[str] = None):
@@ -2351,12 +2369,14 @@ def ensure_task_env(task_id: Optional[str] = None):
         return None
 
     effective_task_id = _resolve_container_task_id(task_id)
+    _, default_backend = _load_backends_config()
+    env_key = _env_key(effective_task_id, default_backend)
 
     # Fast path: already active — mirror terminal_tool and refresh activity.
     existing = get_active_env(effective_task_id)
     if existing is not None:
         with _env_lock:
-            _last_activity[effective_task_id] = time.time()
+            _last_activity[env_key] = time.time()
         return existing
 
     overrides = resolve_task_overrides(task_id)
@@ -2376,7 +2396,7 @@ def ensure_task_env(task_id: Optional[str] = None):
     # Per-task creation lock so a concurrent terminal_tool call and this helper
     # don't each spawn a sandbox for the same task.
     with _creation_locks_lock:
-        task_lock = _creation_locks.setdefault(effective_task_id, threading.Lock())
+        task_lock = _creation_locks.setdefault(env_key, threading.Lock())
 
     with task_lock:
         existing = get_active_env(effective_task_id)
@@ -2405,8 +2425,8 @@ def ensure_task_env(task_id: Optional[str] = None):
             return None
 
         with _env_lock:
-            _active_environments[effective_task_id] = new_env
-            _last_activity[effective_task_id] = time.time()
+            _active_environments[env_key] = new_env
+            _last_activity[env_key] = time.time()
         logger.info(
             "%s environment lazily initialized for task %s",
             env_type, effective_task_id[:8],
@@ -3090,7 +3110,9 @@ def terminal_tool(
             # task_id; honor it instead of spawning a duplicate.
             _existing_key = (
                 _eff_key if _eff_key in _active_environments
-                else (_raw_key if _raw_key and _raw_key in _active_environments else None)
+                else (_raw_key if _raw_key and _raw_key in _active_environments
+                else (effective_task_id if effective_task_id in _active_environments
+                else (task_id if task_id and task_id in _active_environments else None)))
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
@@ -3111,7 +3133,9 @@ def terminal_tool(
                 with _env_lock:
                     _existing_key = (
                         _eff_key if _eff_key in _active_environments
-                        else (_raw_key if _raw_key and _raw_key in _active_environments else None)
+                        else (_raw_key if _raw_key and _raw_key in _active_environments
+                        else (effective_task_id if effective_task_id in _active_environments
+                        else (task_id if task_id and task_id in _active_environments else None)))
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
