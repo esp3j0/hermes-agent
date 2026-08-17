@@ -302,7 +302,10 @@ def test_same_session_recorded_cwd_survives_across_commands(monkeypatch):
 
         def execute(self, command, **kwargs):
             calls.append((command, kwargs))
-            return {"output": "ok", "returncode": 0}
+            # Post-merge: the durable-record write requires the env to have
+            # observed a cwd marker (interrupted commands must not adopt a
+            # stale cwd); a completed FakeEnv command has.
+            return {"output": "ok", "returncode": 0, "cwd_observed": True}
 
     env = FakeEnv()
     task_id = "session-X"
