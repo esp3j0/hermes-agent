@@ -105,6 +105,26 @@ _TITLE_RESPONSE_FORMAT = {
     },
 }
 
+# Relaxed fallback for providers (e.g. DeepSeek) that reject strict
+# json_schema with a 400 but honor json_object. The prompt above already
+# ends with "Reply with JSON only", which is what DeepSeek's json_object
+# mode requires to pass its prompt-content check.
+_JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
+
+
+def _is_response_format_rejection(exc: BaseException) -> bool:
+    """True when the provider rejected the strict json_schema format itself.
+
+    Matches HTTP 400s whose body names ``response_format`` — the signature
+    of a provider that doesn't implement json_schema (DeepSeek: "This
+    response_format type is unavailable now"). Other 400s (auth, model not
+    found, malformed request) must not trigger the relaxed retry.
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status != 400:
+        return False
+    return "response_format" in str(exc)
+
 # Control-tag wrappers that surround machine-authored content inside what is
 # nominally a "user" message. Titling from these is what produces a session
 # named after a slash command or an injected reminder rather than the user's
@@ -391,31 +411,48 @@ def generate_title(
         {"role": "user", "content": user_snippet},
     ]
 
-    try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
-            temperature=0.3,
-            timeout=timeout,
-            main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
-        )
-        content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
-    except Exception as e:
-        # Log at WARNING so this shows up in agent.log without debug mode.
-        # Full detail at debug level for operators who need the stack.
-        logger.warning("Title generation failed: %s", e)
-        logger.debug("Title generation traceback", exc_info=True)
-        if failure_callback is not None:
-            try:
-                failure_callback("title generation", e)
-            except Exception:
-                logger.debug("Title generation failure_callback raised", exc_info=True)
-        return None
+    # Strict json_schema is the expected case; providers that only implement
+    # json_object (DeepSeek et al.) reject it with a 400, so fall back once
+    # to the relaxed format. _extract_title_text tolerates non-compliant
+    # output anyway, so the relaxed retry is strictly better than no title.
+    response_formats = (_TITLE_RESPONSE_FORMAT, _JSON_OBJECT_RESPONSE_FORMAT)
+    for attempt, extra_body in enumerate(
+        {"response_format": fmt} for fmt in response_formats
+    ):
+        try:
+            response = call_llm(
+                task="title_generation",
+                messages=messages,
+                # A title is a handful of tokens. The old 500-token ceiling let a
+                # chatty model burn seconds generating prose we then threw away.
+                max_tokens=64,
+                temperature=0.3,
+                timeout=timeout,
+                main_runtime=main_runtime,
+                extra_body=extra_body,
+            )
+            content = response.choices[0].message.content or ""
+            return _clean_title(_extract_title_text(content))
+        except Exception as e:
+            if attempt == len(response_formats) - 1 or not _is_response_format_rejection(e):
+                # Second attempt failed, or the failure is unrelated to the
+                # strict format (auth, rate limit, ...): give up. Log at
+                # WARNING so this shows up in agent.log without debug mode.
+                # Full detail at debug level for operators who need the stack.
+                logger.warning("Title generation failed: %s", e)
+                logger.debug("Title generation traceback", exc_info=True)
+                if failure_callback is not None:
+                    try:
+                        failure_callback("title generation", e)
+                    except Exception:
+                        logger.debug("Title generation failure_callback raised", exc_info=True)
+                return None
+            logger.debug(
+                "Title provider rejected json_schema response_format (%s); "
+                "retrying with json_object",
+                e,
+            )
+    return None
 
 
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):

@@ -1216,7 +1216,9 @@ _session_cwd: Dict[str, str] = {}
 _session_cwd_lock = threading.Lock()
 
 
-def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
+def record_session_cwd(
+    session_key: Optional[str], cwd: Optional[str], backend: str = ""
+) -> None:
     """Record *cwd* as the working directory of *session_key*.
 
     Called wherever a session's live cwd becomes known: after a terminal
@@ -1224,31 +1226,52 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     resulting cwd) and when a surface registers a workspace cwd override.
     Empty/None session keys collapse to ``"default"`` (single-session CLI).
     Non-string / empty cwds are ignored.
+
+    ``backend`` scopes the record to one named terminal backend: a session
+    that runs commands on several backends must not leak backend A's cwd
+    into backend B's shell (the wrapper ``cd``-ing a path that only exists
+    on A). Backend-scoped records live under ``(session_key, backend)``;
+    a bare key keeps the legacy session-wide record (host workspace
+    overrides, single-backend surfaces).
     """
     if not isinstance(cwd, str) or not cwd.strip():
         return
-    key = str(session_key or "default")
+    key: Any = str(session_key or "default")
+    if backend:
+        key = (key, backend)
     with _session_cwd_lock:
         if _session_cwd.get(key) != cwd:
             _session_cwd[key] = cwd
 
 
-def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
+def get_session_cwd(session_key: Optional[str], backend: str = "") -> Optional[str]:
     """Return the recorded working directory for *session_key*, if any.
+
+    With ``backend`` only the backend-scoped record is read — a plain
+    session-wide record (host workspace override) is not a cwd for an
+    arbitrary backend and callers must opt into that fallback explicitly
+    (it belongs to the session's default backend only).
 
     No fallback chain here on purpose: callers decide what an absent record
     means (config default, TERMINAL_CWD seed, process cwd). ``None``/empty
     keys read the ``"default"`` record.
     """
-    key = str(session_key or "default")
+    key: Any = str(session_key or "default")
+    if backend:
+        key = (key, backend)
     with _session_cwd_lock:
         return _session_cwd.get(key)
 
 
 def clear_session_cwd(session_key: str) -> None:
-    """Drop a session's cwd record (session teardown)."""
+    """Drop a session's cwd records — session-wide and every backend scope."""
+    key = str(session_key or "default")
     with _session_cwd_lock:
-        _session_cwd.pop(session_key, None)
+        _session_cwd.pop(key, None)
+        for _key in [
+            k for k in _session_cwd if isinstance(k, tuple) and len(k) == 2 and k[0] == key
+        ]:
+            _session_cwd.pop(_key, None)
 
 
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
@@ -2744,6 +2767,8 @@ def _resolve_command_cwd(
     default_cwd: str,
     session_key: Optional[str] = None,
     env_type: Optional[str] = None,
+    backend: str = "",
+    default_backend: str = _DEFAULT_BACKEND,
 ) -> str:
     """Return the cwd for a command. Explicit ``workdir=`` overrides everything.
 
@@ -2754,6 +2779,11 @@ def _resolve_command_cwd(
     record yet (first command) runs in ``default_cwd`` (config/override cwd),
     which is also what seeds a fresh environment.
 
+    ``backend`` scopes the record read to the named backend; the session-wide
+    record (host workspace override) only applies when *backend* IS the
+    ``default_backend`` — applying it to ssh/container backends would ``cd``
+    into a path that doesn't exist there.
+
     ``env_type`` makes the record container-aware: on container backends a
     recorded HOST path (a desktop/TUI surface registering its host workspace
     via ``register_task_env_overrides`` → ``record_session_cwd``) is unusable
@@ -2763,7 +2793,12 @@ def _resolve_command_cwd(
     """
     if workdir:
         return workdir
-    recorded = get_session_cwd(session_key)
+    recorded = get_session_cwd(session_key, backend)
+    if recorded is None and backend == default_backend:
+        # Session-wide record (host workspace override / TUI cwd follow) only
+        # applies to the session's default backend — it names a path that
+        # exists there, not on every ssh/container backend.
+        recorded = get_session_cwd(session_key)
     if (
         recorded
         and env_type in _CONTAINER_BACKENDS
@@ -2889,7 +2924,15 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or bcfg.get("cwd", "") or config["cwd"]
+        session_record_cwd = get_session_cwd(task_id, backend_name)
+        if session_record_cwd is None and backend_name == _default_backend:
+            session_record_cwd = get_session_cwd(task_id)
+        cwd = (
+            overrides.get("cwd")
+            or session_record_cwd
+            or bcfg.get("cwd", "")
+            or config["cwd"]
+        )
         # Session-scoped mount resolution (single owner: _resolve_task_host_cwd).
         # Under per-session isolation a fresh session must not inherit the
         # process-global TERMINAL_CWD mount left behind by a previous session.
@@ -3096,7 +3139,9 @@ def terminal_tool(
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
-            guard_cwd_base = get_session_cwd(session_key)
+            guard_cwd_base = get_session_cwd(session_key, backend_name)
+            if guard_cwd_base is None and backend_name == _default_backend:
+                guard_cwd_base = get_session_cwd(session_key)
             if guard_cwd_base is None:
                 guard_cwd_base = getattr(env, "cwd", None) or cwd
             guard_cwd = _resolve_command_cwd(
@@ -3104,6 +3149,8 @@ def terminal_tool(
                 default_cwd=guard_cwd_base,
                 session_key=session_key,
                 env_type=env_type,
+                backend=backend_name,
+                default_backend=_default_backend,
             )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
@@ -3201,6 +3248,8 @@ def terminal_tool(
                 workdir=workdir,
                 default_cwd=cwd,
                 session_key=session_key,
+                backend=backend_name,
+                default_backend=_default_backend,
             )
             _self_repo_hit, _self_repo_msg = detect_self_repo_git_mutation(
                 command, guard_cwd
@@ -3290,6 +3339,8 @@ def terminal_tool(
                 default_cwd=cwd,
                 session_key=session_key,
                 env_type=env_type,
+                backend=backend_name,
+                default_backend=_default_backend,
             )
             try:
                 if env_type == "local":
@@ -3555,6 +3606,8 @@ def terminal_tool(
                         default_cwd=cwd,
                         session_key=session_key,
                         env_type=env_type,
+                        backend=backend_name,
+                        default_backend=_default_backend,
                     )
                     execute_kwargs = {
                         "timeout": effective_timeout,
@@ -3610,7 +3663,16 @@ def terminal_tool(
             # would hijack the session's durable cwd for every later command
             # that doesn't pass ``workdir``. Skip the dual-write in that case.
             if not workdir:
-                record_session_cwd(session_key, getattr(env, "cwd", None))
+                env_cwd = getattr(env, "cwd", None)
+                record_session_cwd(session_key, env_cwd, backend=backend_name)
+                if backend_name == _default_backend:
+                    # Dual-write the DEFAULT backend's cwd to the session-wide
+                    # record: file tools, bang shell, code execution and the
+                    # TUI read that plain key as "the session's cwd", which is
+                    # only true of the default backend. Non-default backends
+                    # update their scoped record exclusively — their cwd must
+                    # never masquerade as the session's.
+                    record_session_cwd(session_key, env_cwd)
 
             # Extract output
             output = result.get("output", "")
