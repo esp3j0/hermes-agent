@@ -14,6 +14,7 @@ services:
     # image: nousresearch/hermes-agent:latest
     build: .
     container_name: hermes
+    network_mode: "container:wg-sidecar"
     restart: unless-stopped
     volumes:
       - ${USERPROFILE}/.hermes:/opt/data
