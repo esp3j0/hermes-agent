@@ -793,15 +793,18 @@ def _get_or_create_env(task_id: str):
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _task_env_overrides,
         _resolve_container_task_id, _resolve_task_host_cwd,
+        get_active_env, _env_key, _load_backends_config,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
+    _, _code_exec_default_backend = _load_backends_config()
 
     # Fast path: environment already exists
-    with _env_lock:
-        if effective_task_id in _active_environments:
-            _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+    env = get_active_env(task_id)
+    if env is not None:
+        with _env_lock:
+            _last_activity[_env_key(effective_task_id, _code_exec_default_backend)] = time.time()
+        return env, _get_env_config()["env_type"]
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
@@ -810,10 +813,11 @@ def _get_or_create_env(task_id: str):
         task_lock = _creation_locks[effective_task_id]
 
     with task_lock:
-        with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
+        env = get_active_env(task_id)
+        if env is not None:
+            with _env_lock:
+                _last_activity[_env_key(effective_task_id, _code_exec_default_backend)] = time.time()
+            return env, _get_env_config()["env_type"]
 
         config = _get_env_config()
         env_type = config["env_type"]
@@ -876,8 +880,11 @@ def _get_or_create_env(task_id: str):
         )
 
         with _env_lock:
-            _active_environments[effective_task_id] = env
-            _last_activity[effective_task_id] = time.time()
+            # Composite (task, backend) key — a bare-string key would let
+            # terminal's legacy lookup serve this local env to a named-backend
+            # request (wrong-host execution).
+            _active_environments[_env_key(effective_task_id, _code_exec_default_backend)] = env
+            _last_activity[_env_key(effective_task_id, _code_exec_default_backend)] = time.time()
 
         _start_cleanup_thread()
         logger.info("%s environment ready for execute_code task %s",

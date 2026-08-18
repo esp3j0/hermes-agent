@@ -176,18 +176,11 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
     """Best-effort terminal backend type for path-resolution decisions."""
     try:
         from tools.terminal_tool import (
-            _active_environments,
-            _env_lock,
             _get_env_config,
-            _resolve_container_task_id,
+            get_active_env,
         )
 
-        try:
-            container_key = _resolve_container_task_id(task_id)
-        except Exception:
-            container_key = task_id
-        with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+        env = get_active_env(task_id)
         if env is not None:
             name = env.__class__.__name__.lower()
             if "local" in name:
@@ -1023,20 +1016,15 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
     """Return the container-side Hermes mirror prefix for Docker file tools."""
     try:
         from tools.terminal_tool import (
-            _active_environments,
-            _env_lock,
             _get_env_config,
-            _resolve_container_task_id,
+            get_active_env,
         )
 
-        container_key = _resolve_container_task_id(task_id)
+        env = get_active_env(task_id)
     except Exception:
         return None
 
     try:
-        with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
-
         if env is not None:
             if env.__class__.__name__ == "DockerEnvironment" and bool(
                 getattr(env, "_persistent", False)
@@ -1420,46 +1408,48 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _resolve_task_host_cwd,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
+        get_active_env, _env_key, _load_backends_config,
     )
     import time
 
     raw_task_id = task_id or "default"
     task_id = _resolve_container_task_id(raw_task_id)
+    _, _file_ops_default_backend = _load_backends_config()
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
     with _file_ops_lock:
         cached = _file_ops_cache.get(task_id)
     if cached is not None:
-        with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                return cached
-            else:
-                # Environment was cleaned up -- preserve the old cwd in the
-                # session record before invalidating the stale cache entry
-                # (fixes #26211: silent file-creation failures in long-running
-                # conversations). Usually a no-op: every completed command
-                # already recorded its cwd.
-                #
-                # Fill-only: ``cached.cwd`` is a snapshot of the SHARED env's
-                # cwd at cache-build time, so it is not attributable to this
-                # session (same class as the interrupted-command bug, #85658).
-                # Rescue a session that has no record, but never overwrite a
-                # record the session wrote for itself.
-                old_cwd = getattr(cached, "cwd", None)
-                if old_cwd:
-                    try:
-                        from tools.terminal_tool import (
-                            get_session_cwd,
-                            record_session_cwd,
-                        )
-                        if get_session_cwd(raw_task_id) is None:
-                            record_session_cwd(raw_task_id, old_cwd)
-                    except Exception:
-                        pass
-                with _file_ops_lock:
-                    _file_ops_cache.pop(task_id, None)
+        env = get_active_env(raw_task_id)
+        if env is not None:
+            with _env_lock:
+                _last_activity[_env_key(task_id, _file_ops_default_backend)] = time.time()
+            return cached
+        # Environment was cleaned up -- preserve the old cwd in the
+        # session record before invalidating the stale cache entry
+        # (fixes #26211: silent file-creation failures in long-running
+        # conversations). Usually a no-op: every completed command
+        # already recorded its cwd.
+        #
+        # Fill-only: ``cached.cwd`` is a snapshot of the SHARED env's
+        # cwd at cache-build time, so it is not attributable to this
+        # session (same class as the interrupted-command bug, #85658).
+        # Rescue a session that has no record, but never overwrite a
+        # record the session wrote for itself.
+        old_cwd = getattr(cached, "cwd", None)
+        if old_cwd:
+            try:
+                from tools.terminal_tool import (
+                    get_session_cwd,
+                    record_session_cwd,
+                )
+                if get_session_cwd(raw_task_id) is None:
+                    record_session_cwd(raw_task_id, old_cwd)
+            except Exception:
+                pass
+        with _file_ops_lock:
+            _file_ops_cache.pop(task_id, None)
 
     # Need to ensure the environment exists before building file_ops.
     # Acquire per-task lock so only one thread creates the sandbox.
@@ -1470,12 +1460,10 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
     with task_lock:
         # Double-check: another thread may have created it while we waited
-        with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                terminal_env = _active_environments[task_id]
-            else:
-                terminal_env = None
+        terminal_env = get_active_env(raw_task_id)
+        if terminal_env is not None:
+            with _env_lock:
+                _last_activity[_env_key(task_id, _file_ops_default_backend)] = time.time()
 
         if terminal_env is None:
             from tools.terminal_tool import resolve_task_overrides
@@ -1567,8 +1555,12 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             )
 
             with _env_lock:
-                _active_environments[task_id] = terminal_env
-                _last_activity[task_id] = time.time()
+                # Cache under the composite (task, backend) key like the
+                # terminal tool; a bare-string key would let terminal's
+                # legacy lookup serve this local env to a named-backend
+                # request (wrong-host execution).
+                _active_environments[_env_key(task_id, _file_ops_default_backend)] = terminal_env
+                _last_activity[_env_key(task_id, _file_ops_default_backend)] = time.time()
 
             _start_cleanup_thread()
             logger.info("%s environment ready for task %s", env_type, task_id[:8])
