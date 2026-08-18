@@ -1214,7 +1214,7 @@ class WeixinAdapter(BasePlatformAdapter):
             1,
             int(
                 extra.get("rate_limit_circuit_threshold")
-                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "1")
+                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "3")
             ),
         )
         self._rate_limit_circuit_window_seconds = float(
@@ -1244,6 +1244,9 @@ class WeixinAdapter(BasePlatformAdapter):
         )
 
         # Text debounce batching (mirrors Telegram adapter pattern).
+        # NOTE: threshold default raised 1 → 3 (30s window): a single -2 is a
+        # jitter blip and just backoff-retries; only 3 in the window opens the
+        # circuit. Tune via WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD env.
         # iLink delivers messages individually, so rapid multi-message
         # bursts (forwarded batches, paste-splits) each trigger a
         # separate agent invocation.  Default 3s delay / 5s split delay
@@ -1759,11 +1762,6 @@ class WeixinAdapter(BasePlatformAdapter):
     def _rate_limit_cooldown_remaining(self) -> float:
         return max(0.0, self._rate_limit_circuit_until - time.monotonic())
 
-    def _rate_limit_error(self) -> RuntimeError:
-        return RuntimeError(
-            f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s"
-        )
-
     def _open_rate_limit_circuit(self) -> None:
         if self._rate_limit_circuit_open_seconds <= 0:
             return
@@ -1822,8 +1820,15 @@ class WeixinAdapter(BasePlatformAdapter):
         last_error: Optional[Exception] = None
         retried_without_token = False
         for attempt in range(self._send_chunk_retries + 1):
-            if self._rate_limit_cooldown_remaining() > 0:
-                raise self._rate_limit_error()
+            # Defer instead of dropping while the rate-limit circuit is open:
+            # sleep out the remaining cooldown (bounded by
+            # _rate_limit_circuit_open_seconds), then try again. The wait
+            # does not consume an attempt — the retry budget is spent only on
+            # real API calls.
+            cooldown = self._rate_limit_cooldown_remaining()
+            if cooldown > 0:
+                await asyncio.sleep(cooldown)
+                continue
             try:
                 resp = await _send_message(
                     self._send_session,
@@ -1870,8 +1875,12 @@ class WeixinAdapter(BasePlatformAdapter):
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
                             if self._record_rate_limit_event():
-                                last_error = self._rate_limit_error()
-                                break
+                                # Circuit just opened: do NOT drop the chunk —
+                                # loop around so the top-of-loop cooldown wait
+                                # pauses for the rest of the window, then retry.
+                                # Events age out of the 30s tally after the
+                                # window, so this path cannot loop forever.
+                                continue
                             if attempt >= self._send_chunk_retries:
                                 break
                             wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
