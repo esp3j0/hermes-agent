@@ -107,6 +107,13 @@ class SSHEnvironment(BaseEnvironment):
         cmd.extend(["-o", "BatchMode=yes"])
         cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
         cmd.extend(["-o", "ConnectTimeout=10"])
+        # Keepalives make a wedged ControlMaster self-detect a dead remote
+        # (host rebooted): the master exits within ~30-45s, removes its
+        # socket, and the next command starts a fresh master. Without this a
+        # master whose TCP died stays alive (ControlPersist=300) and every
+        # reuse hangs until the caller's timeout.
+        cmd.extend(["-o", "ServerAliveInterval=15"])
+        cmd.extend(["-o", "ServerAliveCountMax=2"])
         if self.port != 22:
             cmd.extend(["-p", str(self.port)])
         if self.key_path:
@@ -116,35 +123,80 @@ class SSHEnvironment(BaseEnvironment):
         cmd.append(f"{self.user}@{self.host}")
         return cmd
 
-    def _establish_connection(self):
-        cmd = self._build_ssh_command()
-        cmd.append("echo 'SSH connection established'")
+    def _reset_control_master(self) -> None:
+        """Kill a possibly-wedged ControlMaster and drop its socket.
+
+        A master whose remote TCP died (host reboot) keeps accepting client
+        connections on its socket but never completes them, so every reuse
+        hangs until the caller's timeout. Best-effort: ``-O exit`` the master
+        (no-op when it is already gone) and unlink the socket so the next
+        attempt starts a fresh master with a fresh handshake.
+        """
+        if not _SSH_MULTIPLEX or not self.control_socket.exists():
+            return
         try:
-            result = subprocess.run(
-                cmd,
+            subprocess.run(
+                ["ssh", "-o", f"ControlPath={self.control_socket}",
+                 "-O", "exit", f"{self.user}@{self.host}"],
                 capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=15,
+                timeout=5,
                 stdin=subprocess.DEVNULL,
             )
-            if result.returncode != 0:
-                error_msg = result.stderr.strip() or result.stdout.strip()
-                raise EnvironmentConnectionError(
-                    f"SSH connection failed: {error_msg}",
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            self.control_socket.unlink()
+        except OSError:
+            pass
+
+    def _establish_connection(self):
+        last_error: Exception | None = None
+        for attempt in (1, 2):
+            cmd = self._build_ssh_command()
+            cmd.append("echo 'SSH connection established'")
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True, encoding='utf-8', errors='replace',
+                    timeout=15,
+                    stdin=subprocess.DEVNULL,
+                )
+                if result.returncode != 0:
+                    error_msg = result.stderr.strip() or result.stdout.strip()
+                    raise EnvironmentConnectionError(
+                        f"SSH connection failed: {error_msg}",
+                        retry_hint=(
+                            f"Verify {self.user}@{self.host}:{self.port} is reachable "
+                            "(host up, sshd running, key/agent auth working), then "
+                            "retry — the connection is re-established automatically."
+                        ),
+                    )
+                return
+            except subprocess.TimeoutExpired as exc:
+                last_error = EnvironmentConnectionError(
+                    f"SSH connection to {self.user}@{self.host} timed out",
                     retry_hint=(
-                        f"Verify {self.user}@{self.host}:{self.port} is reachable "
-                        "(host up, sshd running, key/agent auth working), then "
-                        "retry — the connection is re-established automatically."
+                        f"Check network connectivity to {self.host}:{self.port} "
+                        "and that sshd is accepting connections, then retry."
                     ),
                 )
-        except subprocess.TimeoutExpired:
-            raise EnvironmentConnectionError(
-                f"SSH connection to {self.user}@{self.host} timed out",
-                retry_hint=(
-                    f"Check network connectivity to {self.host}:{self.port} "
-                    "and that sshd is accepting connections, then retry."
-                ),
-            )
+                if attempt == 1 and self.control_socket.exists():
+                    # Zombie-socket signature: a leftover ControlMaster whose
+                    # remote is gone hangs reuse instead of refusing it.
+                    # Reset the master and retry once with a fresh handshake.
+                    logger.warning(
+                        "SSH: connection to %s@%s timed out with a ControlMaster "
+                        "socket present — resetting the master and retrying once",
+                        self.user, self.host,
+                    )
+                    self._reset_control_master()
+                    continue
+                raise
+            except EnvironmentConnectionError:
+                raise
+        if last_error is not None:
+            raise last_error
 
     def _detect_remote_home(self) -> str:
         """Detect the remote user's home directory."""
