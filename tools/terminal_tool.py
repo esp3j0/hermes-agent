@@ -3108,11 +3108,19 @@ def terminal_tool(
             # with a CWD-only override collapse to "default" for container
             # sharing, yet an env may already be cached under the originating
             # task_id; honor it instead of spawning a duplicate.
+            #
+            # Raw STRING fallbacks (effective_task_id / task_id) must never
+            # serve a named-backend request: file_tools/code_execution_tool
+            # cache local envs under the bare task_id string, and that entry
+            # hijacks terminal(backend="dev"/"vm-ai") into the local container
+            # (remote backend CWD, execution on the wrong host). Only the
+            # default backend may reuse a string-cached env.
+            _legacy_string_ok = backend_name == _default_backend
             _existing_key = (
                 _eff_key if _eff_key in _active_environments
                 else (_raw_key if _raw_key and _raw_key in _active_environments
-                else (effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)))
+                else (effective_task_id if _legacy_string_ok and effective_task_id in _active_environments
+                else (task_id if task_id and _legacy_string_ok and task_id in _active_environments else None)))
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
@@ -3131,11 +3139,12 @@ def terminal_tool(
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
+                    _legacy_string_ok = backend_name == _default_backend
                     _existing_key = (
                         _eff_key if _eff_key in _active_environments
                         else (_raw_key if _raw_key and _raw_key in _active_environments
-                        else (effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)))
+                        else (effective_task_id if _legacy_string_ok and effective_task_id in _active_environments
+                        else (task_id if task_id and _legacy_string_ok and task_id in _active_environments else None)))
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
@@ -3711,6 +3720,42 @@ def terminal_tool(
             result = None
             command_cwd = None
 
+            # Keep the env alive while a foreground command runs.  The idle
+            # reaper (_cleanup_inactive_envs) reclaims envs whose
+            # _last_activity is older than terminal.lifetime_seconds, but
+            # _last_activity is only stamped at env acquisition — NOT while
+            # a foreground command executes (the activity callback only pings
+            # the gateway; background sessions get keep-alive via
+            # process_registry).  A command running past lifetime_seconds
+            # (default 300) had its env torn down mid-run: env.cleanup()
+            # issues `ssh -O exit`, killing the SSH connection out from under
+            # the command (exit 255; sshd logs "disconnected by user").
+            # Chain our own callback onto whatever the gateway registered so
+            # _last_activity keeps getting stamped for the whole execute().
+            from tools.environments.base import (
+                get_activity_callback,
+                set_activity_callback,
+            )
+
+            _prior_activity_cb = get_activity_callback()
+            # Newly-created envs are cached under _eff_key (_existing_key
+            # stays None on the needs_creation path); cached envs may live
+            # under the raw task_id. Stamping whichever key the env actually
+            # sits under keeps the reaper honest in both cases.
+            _busy_env_key = _existing_key if _existing_key is not None else _eff_key
+
+            def _activity_keepalive(label: str) -> None:
+                if _busy_env_key is not None:
+                    with _env_lock:
+                        _last_activity[_busy_env_key] = time.time()
+                if _prior_activity_cb is not None:
+                    try:
+                        _prior_activity_cb(label)
+                    except Exception:
+                        pass
+
+            set_activity_callback(_activity_keepalive)
+
             # Clean interrupt slate for an approved command, ONCE before the
             # retry loop: drop a stale bit that landed on this thread during the
             # approval-wait so it can't SIGINT the just-approved run.  Do NOT
@@ -3721,57 +3766,62 @@ def terminal_tool(
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
-            while retry_count <= max_retries:
-                try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                        env_type=env_type,
-                        backend=backend_name,
-                        default_backend=_default_backend,
-                    )
-                    execute_kwargs = {
-                        "timeout": effective_timeout,
-                        "cwd": command_cwd,
-                        # Foreground model-facing output: cap retention while
-                        # streaming (head/tail window) so a verbose command
-                        # can't OOM the gateway before truncation (#64435).
-                        # Internal env.execute() consumers (file ops cat
-                        # reads, RPC reads) intentionally stay unbounded.
-                        "bounded_capture": True,
-                    }
-                    result = env.execute(command, **execute_kwargs)
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "timeout" in error_str:
+            try:
+                while retry_count <= max_retries:
+                    try:
+                        command_cwd = _resolve_command_cwd(
+                            workdir=workdir,
+                            default_cwd=cwd,
+                            session_key=session_key,
+                            env_type=env_type,
+                            backend=backend_name,
+                            default_backend=_default_backend,
+                        )
+                        execute_kwargs = {
+                            "timeout": effective_timeout,
+                            "cwd": command_cwd,
+                            # Foreground model-facing output: cap retention while
+                            # streaming (head/tail window) so a verbose command
+                            # can't OOM the gateway before truncation (#64435).
+                            # Internal env.execute() consumers (file ops cat
+                            # reads, RPC reads) intentionally stay unbounded.
+                            "bounded_capture": True,
+                        }
+                        result = env.execute(command, **execute_kwargs)
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if "timeout" in error_str:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": 124,
+                                "error": f"Command timed out after {effective_timeout} seconds"
+                            }, ensure_ascii=False)
+
+                        # Retry on transient errors
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            wait_time = 2 ** retry_count
+                            logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                           wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                            time.sleep(wait_time)
+                            continue
+
+                        logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                     max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
                         return json.dumps({
                             "output": "",
-                            "exit_code": 124,
-                            "error": f"Command timed out after {effective_timeout} seconds"
+                            "exit_code": -1,
+                            "error": _redact_terminal_error_text(
+                                f"Command execution failed: {type(e).__name__}: {e}"
+                            )
                         }, ensure_ascii=False)
-                    
-                    # Retry on transient errors
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        wait_time = 2 ** retry_count
-                        logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                        time.sleep(wait_time)
-                        continue
-                    
-                    logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": _redact_terminal_error_text(
-                            f"Command execution failed: {type(e).__name__}: {e}"
-                        )
-                    }, ensure_ascii=False)
-                
-                # Got a result
-                break
+
+                    # Got a result
+                    break
+            finally:
+                # Restore whatever callback the gateway had registered before
+                # this command; the keepalive wrapper is per-command.
+                set_activity_callback(_prior_activity_cb)
 
             # Dual-write (cwd rearch step 1): the env's post-command tracking
             # (marker parse / local sync) has just updated env.cwd with the
