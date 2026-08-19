@@ -7790,10 +7790,14 @@ class AIAgent:
           * Strip ``reasoning`` on fallback to a strict provider (Mistral,
             Cerebras, Groq) so the strict provider doesn't 400/422 on it.
 
-        Detection (initial): model-name match on ``qwen3.6`` or ``qwen-3.6``
-        — the maintainer-friendly default per the issue author's note.
-        A future config-driven flag (e.g. ``custom_providers[*].preserve_thinking``)
-        would be more robust; today this covers the reported Qwen3.6 / vLLM case.
+        Detection: model-name match on any ``qwen``-prefixed model
+        (``qwen3``, ``qwen3.6``, ``qwen-3.6``, ``qwen27b-...``, …). Dropping
+        prior-turn ``reasoning`` breaks prefix caching for vLLM-served Qwen
+        models: the rendered prompt differs from what vLLM already cached, so
+        every request re-prefills the whole history instead of hitting the
+        prefix cache. Keeping the thinking trace on the wire both preserves
+        the model's reasoning context and keeps the prompt prefix stable
+        across turns.
 
         Refs #56004.
 
@@ -7805,12 +7809,9 @@ class AIAgent:
         if cached is not None and cached[0] == key:
             return cached[1]
         model = (self.model or "").lower()
-        # Word-boundary style match: "qwen3.6" / "qwen-3.6" with an optional
-        # version suffix. We intentionally do NOT match plain "qwen3" —
-        # the preserve_thinking feature was introduced in Qwen3.6 per the
-        # model card, and a too-greedy match would falsely tag older Qwen
-        # models that don't render ``reasoning``.
-        result = bool(re.search(r"qwen[\-_]?3\.6", model))
+        # Match any Qwen model: "qwen3", "qwen3.6", "qwen-3.6", "qwen27b-…"
+        # — an optional separator followed by a digit.
+        result = bool(re.search(r"qwen[\-_]?\d", model))
         self._preserves_thinking_history_cache = (key, result)
         return result
 

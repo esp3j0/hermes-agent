@@ -66,11 +66,23 @@ def test_preserves_thinking_history_matches_qwen_3_6_with_hyphen():
     assert agent._preserves_thinking_history() is True
 
 
-def test_preserves_thinking_history_false_for_qwen3():
-    """Older Qwen3 (without .6) is NOT a thinking-history provider — the
-    preserve_thinking feature was introduced in Qwen3.6 per the model card."""
+def test_preserves_thinking_history_true_for_qwen3():
+    """All Qwen models preserve thinking history. Dropping prior-turn
+    reasoning breaks vLLM prefix caching for Qwen servers: the prompt no
+    longer matches the cached prefix and every request re-prefills."""
     agent = _make_agent(provider="custom", model="Qwen3-32B", base_url="http://10.0.0.5:8000/v1")
-    assert agent._preserves_thinking_history() is False
+    assert agent._preserves_thinking_history() is True
+
+
+def test_preserves_thinking_history_true_for_qwen27b():
+    """A vLLM Qwen27b model (e.g. qwen27b-fp8-tqk8v4-240K-...) must match —
+    the local vm-ai deployment that exposed the prefix-cache regression."""
+    agent = _make_agent(
+        provider="custom",
+        model="qwen27b-fp8-tqk8v4-240K-mtp3-text-image-cu130",
+        base_url="http://192.168.66.101:8000/v1",
+    )
+    assert agent._preserves_thinking_history() is True
 
 
 def test_preserves_thinking_history_false_for_deepseek():
@@ -182,8 +194,8 @@ def test_preserves_thinking_history_cache_is_keyed_by_model_provider_base_url():
     # Same key → cache hit (the result is the same; just exercise the path).
     assert agent._preserves_thinking_history() is True
 
-    # Switching model to a non-think-history model must invalidate.
-    agent.model = "Qwen3-32B"
+    # Switching model to a non-Qwen (non-think-history) model must invalidate.
+    agent.model = "deepseek-v4-flash"
     assert agent._preserves_thinking_history() is False
 
 
