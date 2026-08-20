@@ -22,4 +22,9 @@ PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
 StrictModes no
 UsePAM no
+# Desktop SSH starts an isolated dashboard through this session; without
+# HERMES_HOME it defaults to $HOME/.hermes (/opt/data/.hermes) which does
+# not exist, so the remote side looks unconfigured ("gateway needs setup").
+# The container's real config lives under /opt/data.
+SetEnv HERMES_HOME=/opt/data
 Subsystem sftp internal-sftp
