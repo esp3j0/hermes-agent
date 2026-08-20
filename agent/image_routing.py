@@ -673,21 +673,70 @@ def _guess_mime(path: Path, raw: Optional[bytes] = None) -> str:
     }.get(suffix, "image/jpeg")
 
 
+# Proactive embed governance, mirroring the caps in tools/vision_tools.
+# A local vLLM qwen text-image deployment does NOT reject oversized images —
+# it silently mangles them, so the reactive retry-shrink path never fires and
+# the model sees garbage. Downscale before embedding when the payload would
+# exceed 4 MB or the longest side 7900 px (headroom under Anthropic's
+# 5 MB / 8000 px ceilings). Small images pass through untouched.
+_EMBED_TARGET_BYTES = 4 * 1024 * 1024
+_EMBED_MAX_DIMENSION = 7900
+
+
+def _shrink_for_embed(raw: bytes) -> Optional[bytes]:
+    """Downscale *raw* until it fits the embed caps, or return None for
+    images already within them / unreadable by Pillow.
+
+    Iteratively halves dimensions (LANCZOS) and re-encodes: JPEG with a
+    quality step for opaque images, PNG for anything with an alpha channel
+    (JPEG would flatten transparency to black).
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:
+        return None
+    w, h = img.size
+    if len(raw) <= _EMBED_TARGET_BYTES and max(w, h) <= _EMBED_MAX_DIMENSION:
+        return None
+    has_alpha = "A" in (img.mode or "")
+    out_fmt = "PNG" if has_alpha else "JPEG"
+    scale = 1.0
+    while scale > 0.05:
+        scale *= 0.8
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        if max(nw, nh) > _EMBED_MAX_DIMENSION:
+            continue
+        out = img.resize((nw, nh), Image.LANCZOS)
+        buf = io.BytesIO()
+        if out_fmt == "JPEG":
+            out.save(buf, "JPEG", quality=85)
+        else:
+            out.save(buf, "PNG")
+        if buf.tell() <= _EMBED_TARGET_BYTES:
+            return buf.getvalue()
+    return None
+
+
 def _file_to_data_url(path: Path) -> Optional[str]:
-    """Encode a local image as a base64 data URL at its native size.
+    """Encode a local image as a base64 data URL.
 
-    Size limits are NOT enforced here — the agent retry loop
-    (``run_agent._try_shrink_image_parts_in_messages``) shrinks on the
-    provider's first rejection. Keeping this simple means providers that
-    accept large images (OpenAI 49 MB+, Gemini 100 MB) don't pay a silent
-    quality tax just because one other provider is stricter.
-
-    Format compatibility IS handled here: if the sniffed MIME isn't one
-    of ``_UNIVERSALLY_SUPPORTED_MIMES`` (i.e. it's something like AVIF,
-    HEIC, BMP, TIFF, or ICO that some providers reject outright), we
-    transcode to PNG with Pillow before declaring media_type. This fixes
-    the user-visible "Could not process image" HTTP 400 from Anthropic on
+    Format compatibility is handled here: if the sniffed MIME isn't one of
+    ``_UNIVERSALLY_SUPPORTED_MIMES`` (i.e. it's something like AVIF, HEIC,
+    BMP, TIFF, or ICO that some providers reject outright), we transcode to
+    PNG with Pillow before declaring media_type. This fixes the
+    user-visible "Could not process image" HTTP 400 from Anthropic on
     Discord-attached AVIF/HEIC/BMP files.
+
+    Oversized images are proactively downscaled (see ``_shrink_for_embed``):
+    providers that accept large images still get them, but downscaled to the
+    embed caps so a silently-mangling local vLLM never corrupts the turn.
 
     Returns None if the file can't be read OR if the format isn't
     universally supported AND Pillow can't transcode it (Pillow missing,
@@ -728,6 +777,12 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         )
         raw = transcoded
         mime = "image/png"
+    shrunk = _shrink_for_embed(raw)
+    if shrunk is not None:
+        raw = shrunk
+        # _shrink_for_embed re-encodes: PNG when the source had an alpha
+        # channel, JPEG otherwise. Both are universally supported.
+        mime = "image/png" if raw.startswith(b"\x89PNG") else "image/jpeg"
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
