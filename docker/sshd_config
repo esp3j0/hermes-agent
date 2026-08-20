@@ -1,0 +1,25 @@
+# OpenSSH server config for the hermes container (sshd s6 service).
+#
+# Purpose: Desktop/remote SSH access into the container — Desktop SSH mode
+# logs in, finds /opt/hermes/.venv/bin/hermes, and drives the gateway
+# through a forwarded port.
+#
+# Key-only auth: the deployment key lives at /opt/data/.ssh/id_ed25519(.pub)
+# on the bind-mounted volume; the sshd run script seeds authorized_keys from
+# it on first boot. Password auth is off.
+#
+# UsePAM no: no login sessions in this container (s6-managed), and PAM
+# would pull in extra deps. Account-lock checking still applies via shadow —
+# the Dockerfile unlocks the hermes account at build time.
+#
+# StrictModes no: /opt/data is a bind mount; ownership/perms of the home
+# dir are volume-managed and the strict check would reject otherwise-valid
+# keys on some platforms.
+Port 22
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes no
+UsePAM no
+Subsystem sftp internal-sftp

@@ -1,0 +1,23 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# OpenSSH server for Desktop/remote SSH access into the container.
+#
+# Runs as root (Port 22 binding). Host keys are generated only when
+# missing — the image ships none, so each deployment gets fresh keys
+# (survive container restarts because /etc is image-layer state unless
+# the operator pins them; regenerating on a wiped /etc is the safe
+# default). authorized_keys is seeded from the deployment key when the
+# user has not installed their own yet (fresh /opt/data volumes).
+set -eu
+
+if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+    ssh-keygen -A
+fi
+
+if [ ! -f /opt/data/.ssh/authorized_keys ] && [ -f /opt/data/.ssh/id_ed25519.pub ]; then
+    cp /opt/data/.ssh/id_ed25519.pub /opt/data/.ssh/authorized_keys
+    chown hermes:hermes /opt/data/.ssh/authorized_keys
+    chmod 600 /opt/data/.ssh/authorized_keys
+fi
+
+exec /usr/sbin/sshd -D -e

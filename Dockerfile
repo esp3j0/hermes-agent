@@ -70,7 +70,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # hermes process, the dashboard, and per-profile gateways.
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils openssh-server && \
     rm -rf /var/lib/apt/lists/*
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
@@ -147,7 +147,12 @@ RUN set -eu; \
 COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
-RUN useradd -u 10000 -m -d /opt/data hermes
+# ``useradd`` leaves the account locked (shadow ``!``) which makes sshd
+# refuse every login ("account is locked") even with a valid key. Give it a
+# throwaway password hash at build time to unlock the shadow entry; SSH
+# auth stays key-only (PasswordAuthentication no in docker/sshd_config).
+RUN useradd -u 10000 -m -d /opt/data hermes && \
+    echo 'hermes:hermes-ssh-only' | chpasswd
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
@@ -340,6 +345,13 @@ RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
 # /run/service/ (tmpfs) and are reconciled on container restart by
 # /etc/cont-init.d/02-reconcile-profiles (Phase 4 Task 4.0).
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+
+# OpenSSH server config for the sshd s6 service (Desktop/remote SSH into
+# the container). Overrides the Debian default shipped by the openssh-server
+# package: key-only auth, no PAM (container has no login sessions), and
+# StrictModes off (the hermes home /opt/data is a bind-mounted volume whose
+# ownership semantics the strict check can't rely on).
+COPY docker/sshd_config /etc/ssh/sshd_config
 
 # stage2-hook handles UID/GID remap, volume chown, config seeding,
 # skills sync — all the work the old entrypoint.sh did before
