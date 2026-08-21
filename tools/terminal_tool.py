@@ -3028,11 +3028,16 @@ def terminal_tool(
         session_record_cwd = get_session_cwd(task_id, backend_name)
         if session_record_cwd is None and backend_name == _default_backend:
             session_record_cwd = get_session_cwd(task_id)
+        # Remote SSH backends have no local filesystem: when no cwd is
+        # configured/recorded, default to the remote user's home ("~")
+        # instead of leaking this host's cwd (config["cwd"]) into the
+        # remote wrapper's `cd`, which fails with exit 126 on a path that
+        # only exists locally.
         cwd = (
             overrides.get("cwd")
             or session_record_cwd
             or bcfg.get("cwd", "")
-            or config["cwd"]
+            or ("~" if env_type == "ssh" else config["cwd"])
         )
         # Session-scoped mount resolution (single owner: _resolve_task_host_cwd).
         # Under per-session isolation a fresh session must not inherit the
