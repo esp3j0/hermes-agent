@@ -3032,9 +3032,12 @@ def terminal_tool(
         # configured/recorded, default to the remote user's home ("~")
         # instead of leaking this host's cwd (config["cwd"]) into the
         # remote wrapper's `cd`, which fails with exit 126 on a path that
-        # only exists locally.
+        # only exists locally. The task override (registered by the
+        # gateway/ACP for workspace tracking) is a HOST path — skip it for
+        # ssh backends for the same reason, and keep only remote-side
+        # sources (recorded cwd / backend config / remote home).
         cwd = (
-            overrides.get("cwd")
+            (None if env_type == "ssh" else overrides.get("cwd"))
             or session_record_cwd
             or bcfg.get("cwd", "")
             or ("~" if env_type == "ssh" else config["cwd"])
