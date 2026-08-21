@@ -230,13 +230,32 @@ class SSHEnvironment(BaseEnvironment):
         dirs = [base, f"{base}/skills", f"{base}/credentials", f"{base}/cache"]
         cmd = self._build_ssh_command()
         cmd.append(quoted_mkdir_command(dirs))
-        subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=10,
-            stdin=subprocess.DEVNULL,
-        )
+
+        def _run() -> None:
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=10,
+                stdin=subprocess.DEVNULL,
+            )
+
+        try:
+            _run()
+        except subprocess.TimeoutExpired:
+            # Same zombie-socket signature as _establish_connection: a
+            # leftover ControlMaster whose remote died hangs reuse instead
+            # of refusing it. Reset the master and retry once with a fresh
+            # handshake before giving up.
+            if self.control_socket.exists():
+                logger.warning(
+                    "SSH: _ensure_remote_dirs timed out with a ControlMaster "
+                    "socket present — resetting the master and retrying once"
+                )
+                self._reset_control_master()
+                _run()
+            else:
+                raise
 
     # _get_sync_files provided via iter_sync_files in FileSyncManager init
 
