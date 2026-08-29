@@ -47,16 +47,16 @@ def _model_supports_thinking(model: str | None) -> bool:
 
 
 def _is_glm_5_2(model: str | None) -> bool:
-    """Detect GLM-5.2 across the alias spellings providers use.
+    """GLM-5.2+ (incl. 5.3-flash): native reasoning_effort high/max.
 
-    Covers the canonical ``glm-5.2`` plus the ``glm-5-2`` / ``glm-5p2``
-    variants seen on relays (Fireworks ``glm-5p2``, etc.) and any
-    vendor-prefixed form (``z-ai/glm-5.2``, ``zai-org-glm-5-2``).
+    Matches ``glm-5.2`` through ``glm-5.9`` (any minor ≥ 2) plus the
+    ``glm-5p2`` relay variant, with optional vendor prefixes
+    (``z-ai/glm-5.3-flash``, ``zai-org-glm-5-2``).
     """
     m = (model or "").strip().lower()
     if not m:
         return False
-    return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
+    return re.match(r"^glm-5\.[2-9]", m) is not None or "glm-5p2" in m
 
 
 def _glm_5_2_reasoning_effort(reasoning_config: dict | None) -> str | None:
